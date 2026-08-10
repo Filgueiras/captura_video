@@ -1,0 +1,8 @@
+# pip install -r requisitos.txt
+PySide6>=6.6
+av>=13
+numpy>=1.24
+# Loopback WASAPI: e por ela que se grava o som que sai pelas caixas no
+# Windows, coisa que o FFmpeg embutido no PyAV nao alcanca. Fala COM por
+# ctypes, sem compilar nada. Ver docs/adr/0022.
+soundcard>=0.4.2; sys_platform == "win32"
