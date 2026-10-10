@@ -51,6 +51,7 @@ from PySide6.QtWidgets import (
 )
 
 from . import dispositivos as disp
+from . import memoria
 from . import tema
 from .captura import (
     AUDIO_ATIVO,
@@ -66,6 +67,7 @@ from .captura import (
     VEREDITO_FLUIDO,
     VEREDITO_INSUFICIENTE,
     Configuracao,
+    Medicao,
     MotorCaptura,
     medir_modo,
     resumir_gravacao,
@@ -426,6 +428,9 @@ class JanelaPrincipal(QMainWindow):
         self._canal_audio = None
         self._dispositivos = disp.Dispositivos()
         self._medicoes: dict = {}
+        # Enquanto verdadeiro, mexer nos controles nao grava nada: e a propria
+        # interface se preenchendo, e nao uma escolha do usuario.
+        self._restaurando = False
         self._trabalho: QThread | None = None
         self._amostra_ate = 0.0
         self._inicio_captura = 0.0
@@ -489,6 +494,23 @@ class JanelaPrincipal(QMainWindow):
         self.selo_audio.hide()
         linha.addWidget(self.selo_audio)
         linha.addStretch(1)
+
+        # No cabeçalho, e não num cartão do painel: o painel rola, e no fundo
+        # de um cartão este botão ficava fora da janela em 800px de altura —
+        # existia sem ser encontrável. Aqui está sempre à vista, e o lugar é
+        # honesto: editar não é um ajuste da captura, é o passo seguinte.
+        self.botao_edicao = QPushButton("Editar vídeos…")
+        self.botao_edicao.setToolTip(
+            "Converter formato, cortar as pontas e juntar gravações num "
+            "arquivo só. Trabalha sobre arquivos já gravados; não interrompe "
+            "a captura.")
+        self.botao_edicao.clicked.connect(self.abrir_pos_producao)
+        linha.addWidget(self.botao_edicao)
+
+        # Um respiro antes do seletor de tema: ação de um lado, preferência do
+        # outro. Um QFrame VLine foi tentado aqui e não desenha sobre o fundo
+        # do cabeçalho — o espaço faz o mesmo trabalho sem widget inútil.
+        linha.addSpacing(12)
 
         self._grupo_tema = QButtonGroup(self)
         self._grupo_tema.setExclusive(True)
@@ -865,11 +887,18 @@ class JanelaPrincipal(QMainWindow):
         self._preencher_audio()
 
         if de_tela and not fontes:
-            self.rotulo_modo.setText(
-                "Nenhuma janela encontrada."
-                if tipo == disp.TIPO_JANELA else
-                "Não foi possível enumerar os ecrãs neste sistema."
-            )
+            # A lista vazia quase nunca significa "não há nada aqui": significa
+            # sessão Wayland, ou falta de uma ferramenta de enumeração. Dizer
+            # qual das duas poupa o usuário de procurar o defeito na placa.
+            motivo = (disp.motivo_sem_janela() if tipo == disp.TIPO_JANELA
+                      else disp.motivo_sem_ecra())
+            motivo = motivo or "Não foi possível enumerar os ecrãs neste sistema."
+            # O primeiro parágrafo diz o que houve; o resto, como resolver, vai
+            # para a dica, para não esticar o painel com um texto de ajuda.
+            self.rotulo_modo.setText(motivo.split("\n\n")[0])
+            self.rotulo_modo.setToolTip(motivo)
+        else:
+            self.rotulo_modo.setToolTip("")
 
         self._ajustar_perfil_para_fonte()
         self._video_mudou()
@@ -910,18 +939,34 @@ class JanelaPrincipal(QMainWindow):
     @Slot()
     def _video_mudou(self) -> None:
         dispositivo = self.combo_video.currentData()
-        self.combo_modo.blockSignals(True)
-        self.combo_modo.clear()
-        if dispositivo is not None:
-            melhor = dispositivo.melhor_modo()
-            for indice, modo in enumerate(dispositivo.modos):
-                self.combo_modo.addItem(modo.rotulo, modo)
-                if modo == melhor:
-                    self.combo_modo.setCurrentIndex(indice)
-        self.combo_modo.blockSignals(False)
-        self._pintar_modos()
-        self._modo_mudou()
-        self._ajustar_perfil_para_fonte()
+        chave = dispositivo.chave if dispositivo is not None else ""
+        # O que já se sabe deste aparelho: o que foi medido da última vez e o
+        # que foi escolhido. Sem isso, cada abertura recomeça do palpite.
+        self._medicoes = memoria.medicoes(chave, Medicao) if chave else {}
+        lembrado, perfil_lembrado, qualidade_lembrada = memoria.escolha(chave)
+
+        self._restaurando = True
+        try:
+            self.combo_modo.blockSignals(True)
+            self.combo_modo.clear()
+            if dispositivo is not None:
+                # O modo lembrado só vale se o aparelho ainda o oferecer: a
+                # entrada HDMI pode ter mudado de resolução desde ontem.
+                alvo = lembrado if lembrado in dispositivo.modos else None
+                if alvo is None:
+                    alvo = dispositivo.melhor_modo()
+                for indice, modo in enumerate(dispositivo.modos):
+                    self.combo_modo.addItem(modo.rotulo, modo)
+                    if modo == alvo:
+                        self.combo_modo.setCurrentIndex(indice)
+            self.combo_modo.blockSignals(False)
+
+            self._restaurar_perfil(perfil_lembrado, qualidade_lembrada)
+            self._pintar_modos()
+            self._modo_mudou()
+            self._ajustar_perfil_para_fonte()
+        finally:
+            self._restaurando = False
 
         if (self.combo_tipo.currentData() == disp.TIPO_PLACA
                 and self.check_vincular.isChecked()
@@ -1106,6 +1151,47 @@ class JanelaPrincipal(QMainWindow):
             )
         else:
             self.rotulo_modo.setText(f"{medicao.rotulo_veredito} — {medicao.resumo}")
+        self._guardar_escolha()
+
+    def _restaurar_perfil(self, perfil: str, qualidade: int | None) -> None:
+        """Reaplica perfil e fator de qualidade guardados para este dispositivo.
+
+        São globais no `QSettings` ([0017](../docs/adr/0017-preferencias-em-qsettings.md))
+        e continuam sendo o padrão de quem nunca foi visto; a memória por
+        dispositivo só passa na frente quando existe, porque arquivar uma placa
+        e compartilhar uma captura de tela pedem ajustes diferentes.
+        """
+        if perfil:
+            indice = self.combo_perfil.findData(perfil)
+            if indice >= 0:
+                self.combo_perfil.blockSignals(True)
+                self.combo_perfil.setCurrentIndex(indice)
+                self.combo_perfil.blockSignals(False)
+                self._perfil_mudou()
+        if qualidade is not None:
+            self.spin_qualidade.blockSignals(True)
+            self.spin_qualidade.setValue(int(qualidade))
+            self.spin_qualidade.blockSignals(False)
+
+    def _guardar_escolha(self) -> None:
+        """Anota o que este dispositivo está usando agora, para a próxima vez.
+
+        Sai calado quando o dispositivo não tem identidade estável ou quando a
+        interface ainda está sendo montada: gravar durante o preenchimento
+        sobrescreveria a memória com o palpite automático, que é exatamente o
+        que ela existe para não fazer.
+        """
+        if self._restaurando:
+            return
+        dispositivo = self.combo_video.currentData()
+        if dispositivo is None or not dispositivo.chave:
+            return
+        memoria.lembrar_escolha(
+            dispositivo.chave,
+            self.combo_modo.currentData(),
+            self.combo_perfil.currentData(),
+            self.spin_qualidade.value(),
+        )
 
     def _pintar_modos(self) -> None:
         """Marca cada modo com a cor do veredito medido."""
@@ -1128,9 +1214,19 @@ class JanelaPrincipal(QMainWindow):
             rotulo = modo.rotulo
             if medicao.veredito == VEREDITO_ERRO:
                 texto = f"{_SINAL[medicao.veredito]}  {rotulo} — não abriu"
-            else:
+            elif round(medicao.fps_real) == round(modo.fps):
+                # Entrega o que promete: repetir o número mediria a mesma coisa
+                # duas vezes e faria dois modos diferentes parecerem iguais.
                 texto = (f"{_SINAL[medicao.veredito]}  {modo.largura}x{modo.altura}"
-                         f"  {medicao.fps_real:.0f} fps reais  [{modo.codec}]")
+                         f"  {modo.fps:g} fps  [{modo.codec}]")
+            else:
+                # A seta é a informação: pedir 60 nesta placa devolve 30, e o
+                # modo de 30 logo abaixo entrega os mesmos 30 sem os quadros de
+                # enchimento. Sem a taxa pedida no rótulo, os dois ficariam com
+                # o mesmo texto e a escolha viraria adivinhação.
+                texto = (f"{_SINAL[medicao.veredito]}  {modo.largura}x{modo.altura}"
+                         f"  {modo.fps:g} → {medicao.fps_real:.0f} fps reais"
+                         f"  [{modo.codec}]")
             self.combo_modo.setItemText(indice, texto)
 
     # -- teste de equipamento ----------------------------------------------
@@ -1185,6 +1281,9 @@ class JanelaPrincipal(QMainWindow):
     @Slot(object)
     def _teste_concluiu(self, medicoes: dict) -> None:
         self._medicoes = medicoes
+        dispositivo = self.combo_video.currentData()
+        if dispositivo is not None:
+            memoria.lembrar_medicoes(dispositivo.chave, medicoes)
         self.barra_teste.hide()
         self.botao_testar.setEnabled(True)
         self.botao_testar.setText("Testar equipamento")
@@ -1535,11 +1634,25 @@ class JanelaPrincipal(QMainWindow):
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(self._pasta)))
 
     @Slot()
+    def abrir_pos_producao(self) -> None:
+        """Abre a janela de conversão, corte e junção.
+
+        Importada aqui, e não no topo: quem só grava nunca paga o custo de
+        carregar o módulo, e a captura continua sendo o caminho principal.
+        """
+        from .janela_edicao import JanelaEdicao
+
+        janela = JanelaEdicao(codificadores_disponiveis(), self)
+        janela.setStyleSheet(self.styleSheet())
+        janela.exec()
+
+    @Slot()
     def _perfil_mudou(self) -> None:
         h264 = self.combo_perfil.currentData() == PERFIL_H264
         self.combo_codificador.setEnabled(h264)
         self.spin_qualidade.setEnabled(h264)
         self.config.setValue("perfil", self.combo_perfil.currentData())
+        self._guardar_escolha()
 
     @Slot()
     def _escolher_pasta(self) -> None:
@@ -1718,6 +1831,7 @@ class JanelaPrincipal(QMainWindow):
                 self._trabalho.cancelar()
             self._trabalho.wait(3000)
         self.config.setValue("qualidade", self.spin_qualidade.value())
+        self._guardar_escolha()
         self.motor.parar()
         self._fechar_saida_audio()
         super().closeEvent(evento)

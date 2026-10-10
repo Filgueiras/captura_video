@@ -16,6 +16,28 @@ _ALSA_PLUGINS = (
 )
 
 
+def pasta_plugins_alsa() -> Path | None:
+    """Onde moram os plugins `.so` do alsa-lib nesta maquina, se e que moram.
+
+    Respeita ALSA_PLUGIN_DIR quando ja definida — e a mesma variavel que o
+    `_reparar_alsa` escreve, entao depois da importacao do pacote este e o
+    caminho que o alsa-lib vai de fato consultar.
+    """
+    if platform.system() != "Linux":
+        return None
+
+    definida = os.environ.get("ALSA_PLUGIN_DIR")
+    if definida:
+        return Path(definida)
+
+    maquina = platform.machine()
+    for molde in _ALSA_PLUGINS:
+        pasta = Path(molde.format(maquina=maquina))
+        if pasta.is_dir():
+            return pasta
+    return None
+
+
 def _reparar_alsa() -> None:
     """Aponta o alsa-lib embutido no PyAV para a configuracao do sistema.
 
@@ -41,12 +63,9 @@ def _reparar_alsa() -> None:
 
     if "ALSA_PLUGIN_DIR" in os.environ:
         return
-    maquina = platform.machine()
-    for molde in _ALSA_PLUGINS:
-        pasta = Path(molde.format(maquina=maquina))
-        if pasta.is_dir():
-            os.environ["ALSA_PLUGIN_DIR"] = str(pasta)
-            return
+    pasta = pasta_plugins_alsa()
+    if pasta is not None:
+        os.environ["ALSA_PLUGIN_DIR"] = str(pasta)
 
 
 # Precisa acontecer antes de o PyAV carregar o alsa-lib, ou seja, antes de

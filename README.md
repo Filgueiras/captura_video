@@ -29,7 +29,9 @@ entregam imagem borrada.
 No Windows a captura de ecrã usa a **Desktop Duplication API** (`ddagrab`), a
 mesma via do OBS. Medido nesta máquina: **41 fps** contra 17 do método antigo
 (`gdigrab`). Janelas específicas usam `gdigrab`, que é o único caminho para
-alvos individuais — e entrega 30 fps sem esforço.
+alvos individuais — e entrega 30 fps sem esforço. No Linux os dois casos usam
+`x11grab`, a janela pelo seu identificador, para a gravação acompanhá-la quando
+ela for movida ou redimensionada.
 
 Capturar os dois monitores num arquivo só é possível, mas custa o dobro de
 pixels: aqui o desktop combinado (3840x1080) caiu para 11 fps. Prefira um
@@ -48,7 +50,8 @@ monitor de cada vez.
   terceiros, nem privilégio de administrador. Gravando uma placa, essa mesma
   fonte é a errada e vai para o fim da lista. Com ela selecionada, *Ouvir o
   áudio* fica travado: reproduzir o que acabou de ser capturado realimentaria a
-  captura. Ver [ADR-0022](docs/adr/0022-audio-do-computador-por-wasapi.md).
+  captura. Ver [ADR-0022](docs/adr/0022-audio-do-computador-por-wasapi.md) e
+  [ADR-0023](docs/adr/0023-pulseaudio-pelo-plugin-do-alsa.md).
 - Escolhe o formato de maior qualidade real, preferindo codec comprimido.
   É a diferença entre 1080p e 640x480 na mesma placa.
 
@@ -64,6 +67,16 @@ monitor de cada vez.
 - **Gravar amostra** grava 10 segundos e depois *confere o arquivo*: quadros que
   sobreviveram, taxa efetiva, desencontro entre áudio e vídeo, e quantos MB por
   minuto aquilo consome.
+- **Lembra o que você escolheu, por aparelho.** O modo, o perfil, o fator de
+  qualidade e o resultado do teste ficam guardados e voltam sozinhos na próxima
+  vez que a mesma placa for ligada — testar deixa de ser pedágio de toda
+  abertura. Um modo só é reaplicado se o aparelho ainda o oferecer, então nada
+  quebra quando a entrada HDMI muda de resolução
+  ([ADR-0025](docs/adr/0025-memoria-de-escolhas-por-dispositivo.md)).
+- **Mostra a taxa pedida ao lado da entregue** quando as duas divergem:
+  `1920x1080  60 → 30 fps reais`. Muitas placas anunciam 60 e entregam 30 com
+  metade dos quadros vazios — pedir 30 direto dá a mesma imagem com metade do
+  tráfego, e essa opção está na lista.
 
 **Grava**
 
@@ -90,6 +103,37 @@ monitor de cada vez.
   e a barra de status marca `sem áudio` (ou `silêncio`) ao lado do REC. Um
   arquivo mudo só costuma dar as caras quando já não dá para regravar.
   A opção *Avisar se faltar áudio* desliga a pergunta (o selo continua).
+
+**Ajusta depois de gravar**
+
+O botão **Editar vídeos…**, no cabeçalho, abre uma janela que trabalha sobre
+arquivos já gravados, sem atrapalhar a captura. Com um arquivo inteiro ela **converte**; com início e
+fim marcados, **corta as pontas**; com vários arquivos, **junta tudo num vídeo
+só** — e dá para fazer os três de uma vez.
+
+**Os cortes são marcados olhando.** A prévia ocupa a janela: arraste a barra,
+ande de quadro em quadro pelos botões ou pelas setas, e fixe o ponto que está na
+tela com *Marcar início* e *Marcar fim* (ou as teclas `I` e `O`, como em
+qualquer editor). Uma faixa abaixo da barra mostra, do arquivo inteiro, que
+pedaço vai sobrar. Cada arquivo da lista guarda as suas próprias marcas.
+
+Duas formas de escrever, e a escolha é sua:
+
+| | Copiar | Recomprimir |
+|---|---|---|
+| Velocidade | instantâneo | minutos |
+| Qualidade | idêntica ao original | perde uma geração |
+| Corte | no quadro-chave mais próximo | exato |
+| Tamanho | igual ao original | muito menor |
+| Juntar origens diferentes | recusa e explica | uniformiza |
+
+Medido aqui: 8 s de gravação da placa (MJPEG + PCM, 16,7 MB) viraram **0,4 MB**
+em H.264/AAC. E a sincronia sobrevive — juntar dois clipes, cortar um deles e
+recomprimir tudo saiu com **+1,7 ms** de desencontro
+([ADR-0026](docs/adr/0026-pos-producao-copia-ou-recompressao.md)).
+
+A prévia é silenciosa e a marcação é por quadro, não por forma de onda: serve
+para tirar as pontas e emendar gravações, não para montagem fina.
 
 **Interface**
 
@@ -125,10 +169,14 @@ Se nenhuma placa aparecer: Configurações → Privacidade → Câmera → ative
 ### Linux (Ubuntu, Zorin, Debian e derivados)
 
 ```bash
-sudo apt install python3-venv v4l-utils
+sudo apt install python3-venv v4l-utils libasound2-plugins
 python3 -m venv ~/.venvs/captura_video
 ~/.venvs/captura_video/bin/pip install -r requisitos.txt
 ```
+
+O `libasound2-plugins` é o que dá acesso ao PulseAudio/PipeWire — sem ele o app
+enxerga só placas ALSA cruas e o *áudio do computador* some. Ele já vem em
+instalações de desktop; a linha acima só garante.
 
 O **venv não é opcional**: no Ubuntu 24.04 e derivados (Zorin 18) o `pip` recusa
 instalar no Python do sistema (PEP 668). O `capturar.sh` procura o ambiente
@@ -139,14 +187,19 @@ Acesso a `/dev/video*` costuma já vir por ACL em sistemas com `systemd-logind`;
 confira com `getfacl /dev/video0` e, se preciso, use
 `sudo usermod -aG video $USER` (exige reentrar na sessão).
 
-O áudio usa PulseAudio/PipeWire quando disponível e cai para ALSA caso
-contrário — a escolha é automática e leva em conta o que o FFmpeg embutido no
-PyAV realmente suporta. No caminho ALSA o app ainda repara a cópia do alsa-lib
-que vem dentro do wheel do PyAV, que sobe sem configuração e faria a gravação
-sair muda ([ADR-0020](docs/adr/0020-reparar-o-alsa-embutido-no-pyav.md)).
+O áudio chega ao PulseAudio/PipeWire pelo plugin `pulse` do alsa-lib, porque os
+wheels do PyAV não trazem o demuxer `pulse`
+([ADR-0023](docs/adr/0023-pulseaudio-pelo-plugin-do-alsa.md)). É automático, e é
+o que faz funcionarem o áudio do computador e o pareamento com a placa. Antes
+disso o app repara a cópia do alsa-lib que vem dentro do wheel, que sobe sem
+configuração e faria a gravação sair muda
+([ADR-0020](docs/adr/0020-reparar-o-alsa-embutido-no-pyav.md)).
 
-**Captura de ecrã e de janela exigem sessão Xorg** — sob Wayland gravam preto.
-A placa de captura funciona nas duas sessões.
+**A captura de ecrã exige sessão Xorg** — sob Wayland o app não a oferece, em vez
+de gravar preto. **Captura de janela funciona nas duas**, para aplicativos que
+rodem sobre XWayland
+([ADR-0024](docs/adr/0024-janela-por-window-id-e-wayland-pelo-tipo-de-sessao.md)).
+A placa de captura funciona em qualquer sessão.
 
 Em Fedora: `sudo dnf install v4l-utils`. Em Arch: `sudo pacman -S v4l-utils`.
 
@@ -157,7 +210,9 @@ Em Fedora: `sudo dnf install v4l-utils`. Em Arch: `sudo pacman -S v4l-utils`.
 É um aplicativo de janela (desktop), não uma página no navegador.
 
 **Windows** — duplo clique em `Captura USB.bat`.
-**Linux** — `./capturar.sh` (uma vez: `chmod +x capturar.sh`).
+**Linux** — `./capturar.sh` (uma vez: `chmod +x capturar.sh`), ou
+`./instalar_atalho.sh` uma única vez para ganhar um item «Captura USB» no menu
+de aplicativos e não precisar mais do terminal.
 
 Ou, de dentro da pasta do projeto:
 
@@ -165,6 +220,7 @@ Ou, de dentro da pasta do projeto:
 python -m capturador             # abre a janela
 python -m capturador --listar    # dispositivos e formatos, sem abrir a janela
 python -m capturador --medir     # mede a taxa real de cada modo no terminal
+python -m capturador --memoria   # o que ficou lembrado de cada aparelho
 ```
 
 1. **Fonte** — escolha o tipo (placa, ecrã ou janela) e depois a fonte. Sendo
@@ -181,6 +237,9 @@ python -m capturador --medir     # mede a taxa real de cada modo no terminal
 | `F11` / duplo clique | tela cheia |
 | `F12` | foto em resolução nativa |
 | `Esc` | sai da tela cheia |
+
+Na janela de pós-produção: `I` marca o início, `O` marca o fim, `←` e `→` andam
+um quadro.
 
 ---
 
@@ -211,10 +270,14 @@ sobrevive a um desligamento no meio da gravação — o arquivo continua abrindo
 | [capturador/dispositivos.py](capturador/dispositivos.py) | enumeração e pareamento por plataforma; único lugar com código específico de SO |
 | [capturador/captura.py](capturador/captura.py) | leitura das threads, remultiplexação, codificação, medição |
 | [capturador/tema.py](capturador/tema.py) | fichas de design e folha de estilo |
+| [capturador/edicao.py](capturador/edicao.py) | pós-produção: converter, cortar e juntar |
+| [capturador/janela_edicao.py](capturador/janela_edicao.py) | janela da pós-produção |
+| [capturador/memoria.py](capturador/memoria.py) | o que ficou lembrado de cada aparelho (SQLite) |
 | [capturador/janela.py](capturador/janela.py) | interface |
 | [capturador/__main__.py](capturador/__main__.py) | linha de comando |
 | [capturador.spec](capturador.spec) | receita do PyInstaller |
 | [principal.py](principal.py) | ponto de entrada do executável empacotado |
+| [capturar.sh](capturar.sh) / [instalar_atalho.sh](instalar_atalho.sh) | abrir e integrar ao menu, no Linux |
 
 ### Mexendo no layout
 

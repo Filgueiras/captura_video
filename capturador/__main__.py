@@ -2,6 +2,7 @@
 
     python -m capturador            abre a janela
     python -m capturador --listar   imprime os dispositivos e sai
+    python -m capturador --memoria  mostra o que ficou lembrado de cada aparelho
 """
 
 from __future__ import annotations
@@ -83,6 +84,43 @@ def _medir(duracao: float, tudo: bool) -> int:
     return 0
 
 
+def _memoria(esquecer: bool) -> int:
+    import time
+
+    from . import memoria
+    from .captura import Medicao
+
+    if esquecer:
+        memoria.esquecer_tudo()
+        print("Memória apagada. Na próxima abertura, tudo volta ao palpite automático.")
+        return 0
+
+    linhas = memoria.resumo()
+    print(f"Banco: {memoria.caminho_banco()}\n")
+    if not linhas:
+        print("Nada lembrado ainda. A memória se enche sozinha conforme você usa:")
+        print("cada escolha de modo é anotada, e «Testar equipamento» guarda o")
+        print("resultado para não precisar medir de novo.")
+        return 0
+
+    for chave, quantos, visto_em in linhas:
+        quando = time.strftime("%d/%m/%Y %H:%M", time.localtime(visto_em))
+        modo, perfil, qualidade = memoria.escolha(chave)
+        print(f"{chave}")
+        print(f"       usado em: {quando}")
+        print(f"       modo    : {modo.rotulo if modo else '—'}")
+        print(f"       perfil  : {perfil or '—'}"
+              + (f"   qualidade: {qualidade}" if qualidade is not None else ""))
+        if quantos:
+            print(f"       medidos : {quantos} modos")
+            for m, med in sorted(memoria.medicoes(chave, Medicao).items(),
+                                 key=lambda p: (-p[0].pixels, -p[0].fps)):
+                print(f"                 {m.rotulo:44}  {med.rotulo_veredito}"
+                      f"  ({med.fps_real:.0f} fps reais)")
+        print()
+    return 0
+
+
 def _janela() -> int:
     from PySide6.QtWidgets import QApplication
 
@@ -116,12 +154,22 @@ def main() -> int:
         "--tudo", action="store_true",
         help="com --medir, inclui também os formatos não comprimidos (bem mais lento)",
     )
+    analisador.add_argument(
+        "--memoria", action="store_true",
+        help="mostra o modo, o perfil e as medições lembrados de cada aparelho",
+    )
+    analisador.add_argument(
+        "--esquecer", action="store_true",
+        help="com --memoria, apaga tudo o que foi lembrado",
+    )
     argumentos = analisador.parse_args()
 
     if argumentos.listar:
         return _listar()
     if argumentos.medir:
         return _medir(argumentos.segundos, argumentos.tudo)
+    if argumentos.memoria or argumentos.esquecer:
+        return _memoria(argumentos.esquecer)
     return _janela()
 
 

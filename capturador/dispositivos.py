@@ -19,6 +19,8 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import pasta_plugins_alsa
+
 # Codecs comprimidos que valem a pena priorizar: entregam resolucao cheia com
 # taxa de quadros alta dentro do orcamento de banda do USB.
 CODECS_COMPRIMIDOS = ("mjpeg", "h264", "hevc", "mjpg")
@@ -91,6 +93,22 @@ class DispositivoVideo:
     tipo: str = TIPO_PLACA
     indice: int = 0                 # saida de video, para telas
     origem: tuple[int, int] = (0, 0)  # canto superior esquerdo, para telas
+    # Como reconhecer este mesmo aparelho na proxima abertura do programa. Nao
+    # serve `caminho`: `/dev/video0` vira `/dev/video1` se a placa for ligada
+    # depois de outra, e o identificador de uma janela X muda a cada execucao.
+    # Vazio significa "sem identidade estavel" — nada sera lembrado.
+    identidade: str = ""
+
+    @property
+    def chave(self) -> str:
+        """Identificador para a memoria de escolhas. Vazio = nao memorizavel.
+
+        O tipo entra junto porque «Ecrã 1» e uma placa chamada «Ecrã 1» sao
+        coisas diferentes, e porque cada forma de capturar tem as suas proprias
+        medicoes: os modos de uma tela sao inventados por nos, os de uma placa
+        vem do aparelho.
+        """
+        return f"{self.tipo}:{self.identidade}" if self.identidade else ""
 
     @property
     def permite_copia(self) -> bool:
@@ -149,9 +167,15 @@ class DispositivoVideo:
                 "framerate": f"{modo.fps:g}",
                 "draw_mouse": "1" if cursor else "0",
             }
-        x, y = self.origem
-        return f"{os.environ.get('DISPLAY', ':0.0')}+{x},{y}", "x11grab", {
+        # `window_id` e o que faz o x11grab capturar a janela, e nao um retangulo
+        # da tela nas coordenadas onde ela estava quando foi enumerada. A
+        # diferenca aparece assim que a janela e movida: pelo retangulo, a
+        # gravacao continua no lugar antigo, mostrando o que passou a ocupa-lo.
+        # O `caminho` e o identificador em hexa que a enumeracao guardou.
+        return os.environ.get("DISPLAY", ":0.0"), "x11grab", {
+            "window_id": str(int(self.caminho, 16)),
             "framerate": f"{modo.fps:g}",
+            "draw_mouse": "1" if cursor else "0",
             "video_size": f"{modo.largura}x{modo.altura}",
         }
 
@@ -249,19 +273,50 @@ DICA_LOOPBACK_WINDOWS = (
     "Depois de habilitar, clique em «Procurar dispositivos»."
 )
 
-DICA_LOOPBACK_LINUX = (
+_DICA_LOOPBACK_SEM_PACTL = (
     "Gravar o som do computador aqui depende do PulseAudio/PipeWire: a fonte "
-    "«.monitor» da saída em uso é o que captura o que sai pelas caixas. Ela não "
-    "apareceu, o que normalmente significa que o servidor de som não está "
-    "rodando ou que o PyAV desta máquina foi compilado sem o demuxer `pulse` — "
-    "nesse caso só há entradas ALSA, e ALSA não tem monitor da saída.\n\n"
-    "Depois de resolver, clique em «Procurar dispositivos»."
+    "«monitor» da saída em uso é o que captura o que sai pelas caixas.\n\n"
+    "O comando `pactl`, que é por onde essas fontes são descobertas, não foi "
+    "encontrado. Instale com:\n\n"
+    "    sudo apt install pulseaudio-utils\n\n"
+    "Depois clique em «Procurar dispositivos»."
+)
+
+_DICA_LOOPBACK_SEM_PLUGIN = (
+    "Gravar o som do computador aqui depende do PulseAudio/PipeWire: a fonte "
+    "«monitor» da saída em uso é o que captura o que sai pelas caixas.\n\n"
+    "O FFmpeg embutido no PyAV não traz o demuxer `pulse`, e o plugin do "
+    "alsa-lib que serviria de ponte não está instalado. Ele vem em:\n\n"
+    "    sudo apt install libasound2-plugins\n\n"
+    "Depois clique em «Procurar dispositivos». (Em Fedora: sudo dnf install "
+    "alsa-plugins-pulseaudio; em Arch: sudo pacman -S alsa-plugins.)"
+)
+
+_DICA_LOOPBACK_SEM_SERVIDOR = (
+    "Gravar o som do computador aqui depende do PulseAudio/PipeWire: a fonte "
+    "«monitor» da saída em uso é o que captura o que sai pelas caixas.\n\n"
+    "O caminho até o servidor de som existe nesta máquina, mas nenhuma fonte "
+    "foi listada — normalmente porque o servidor não está no ar para este "
+    "usuário. Confira com:\n\n"
+    "    pactl info\n\n"
+    "Depois clique em «Procurar dispositivos»."
 )
 
 
 def dica_loopback() -> str:
-    """Como habilitar a captura do audio do computador nesta plataforma."""
-    return DICA_LOOPBACK_WINDOWS if WINDOWS else DICA_LOOPBACK_LINUX
+    """Como habilitar a captura do audio do computador nesta plataforma.
+
+    No Linux a resposta depende de onde a cadeia quebrou, e sao tres pontos
+    diferentes com tres solucoes diferentes; mandar o usuario conferir os tres
+    seria devolver o trabalho de diagnostico para ele.
+    """
+    if WINDOWS:
+        return DICA_LOOPBACK_WINDOWS
+    if not _tem("pactl"):
+        return _DICA_LOOPBACK_SEM_PACTL
+    if via_audio_linux() == VIA_ALSA:
+        return _DICA_LOOPBACK_SEM_PLUGIN
+    return _DICA_LOOPBACK_SEM_SERVIDOR
 
 
 def _e_loopback_windows(nome: str) -> bool:
@@ -355,21 +410,74 @@ def formato_entrada_video() -> str:
     return "dshow" if WINDOWS else "v4l2"
 
 
-def formato_entrada_audio() -> str:
-    """Backend de audio, limitado ao que o FFmpeg embutido no PyAV realmente tem.
+# Como as fontes do PulseAudio/PipeWire sao alcancadas nesta maquina. A
+# diferenca entre as duas primeiras esta so na sintaxe do caminho e no demuxer;
+# o que chega e a mesma fonte, com o mesmo nome.
+VIA_PULSE_DEMUXER = "pulse-demuxer"  # demuxer `pulse` do FFmpeg, caminho cru
+VIA_PULSE_ALSA = "pulse-alsa"        # plugin do alsa-lib, caminho "pulse:<fonte>"
+VIA_ALSA = "alsa"                    # sem servidor de som: so hw:N,0
 
-    Nem todo wheel do PyAV e compilado com libpulse, entao nao basta o `pactl`
-    existir no sistema: o demuxer precisa estar presente tambem, senao a
-    abertura falha com "Unknown input format".
+_PLUGIN_ALSA_PULSE = "libasound_module_pcm_pulse.so"
+
+
+def via_audio_linux() -> str:
+    """Por onde da para falar com o servidor de som nesta maquina.
+
+    O caminho obvio seria o demuxer `pulse` do FFmpeg, mas os wheels do PyAV
+    nao sao compilados com libpulse: `av.formats_available` traz `alsa`,
+    `x11grab` e `kmsgrab`, nunca `pulse`. Na pratica, entao, a primeira via
+    quase nunca existe.
+
+    A segunda recupera tudo o que ela daria. O alsa-lib tem um plugin que fala
+    o protocolo do PulseAudio, e a configuracao do sistema o declara aceitando
+    o nome da fonte como argumento (`pcm.pulse { @args [ DEVICE ] }`, em
+    `/usr/share/alsa/alsa.conf.d/50-pulseaudio.conf`). Com isso,
+    `pulse:<fonte>` aberto pelo demuxer `alsa` chega exatamente na mesma fonte
+    que o demuxer `pulse` abriria — inclusive nos monitores de saida, que sao
+    o unico jeito de gravar o som do computador. Ver ADR-0023.
+
+    A terceira e a rede de seguranca de sempre: sem servidor de som, so restam
+    as placas que o kernel registra.
+
+    Nao e cacheado de proposito. O botao «Procurar dispositivos» promete
+    reavaliar a maquina, e quem acabou de subir o PipeWire tem de ver o
+    resultado sem reabrir o programa.
+    """
+    if WINDOWS:
+        return VIA_ALSA
+
+    if not _tem("pactl"):
+        return VIA_ALSA
+
+    try:
+        import av  # importado aqui para o modulo continuar util sem o PyAV
+
+        if "pulse" in av.formats_available:
+            return VIA_PULSE_DEMUXER
+    except Exception:
+        pass
+
+    pasta = pasta_plugins_alsa()
+    if pasta is not None and (pasta / _PLUGIN_ALSA_PULSE).is_file():
+        return VIA_PULSE_ALSA
+    return VIA_ALSA
+
+
+def formato_entrada_audio() -> str:
+    """Demuxer que abre os caminhos produzidos pela enumeracao desta plataforma.
+
+    Anda junto com `via_audio_linux`: quando a via e o plugin do alsa-lib, o
+    demuxer continua sendo o `alsa` — quem sabe do PulseAudio e o plugin, nao
+    o FFmpeg.
     """
     if WINDOWS:
         return "dshow"
+    return "pulse" if via_audio_linux() == VIA_PULSE_DEMUXER else "alsa"
 
-    import av  # importado aqui para o modulo continuar util sem o PyAV
 
-    if _tem("pactl") and "pulse" in av.formats_available:
-        return "pulse"
-    return "alsa"
+def _caminho_fonte_pulse(fonte: str, via: str) -> str:
+    """Nome de fonte do PulseAudio no formato que o demuxer escolhido aceita."""
+    return fonte if via == VIA_PULSE_DEMUXER else f"pulse:{fonte}"
 
 
 def _tem(programa: str) -> bool:
@@ -381,13 +489,22 @@ def _rodar(argumentos: list[str], tempo_limite: int = 20) -> str:
 
     O ffmpeg escreve as listagens em stderr e termina com codigo de erro; isso
     e esperado, entao o codigo de saida e ignorado de proposito.
+
+    Roda com o locale em C porque todas as regex deste modulo foram escritas
+    contra a saida em ingles. O `pactl` traduz os rotulos dos campos: num
+    desktop em portugues ele escreve "Fonte #53" e "Nome:" no lugar de
+    "Source #53" e "Name:", e o pareamento por nome nao acha mais nada. Os
+    nomes dos dispositivos continuam vindo em UTF-8 — o locale muda as
+    mensagens do programa, nao os dados que ele transporta.
     """
+    ambiente = {**os.environ, "LC_ALL": "C", "LANG": "C"}
     try:
         proc = subprocess.run(
             argumentos,
             capture_output=True,
             timeout=tempo_limite,
             creationflags=_SEM_JANELA,
+            env=ambiente,
         )
     except (OSError, subprocess.SubprocessError):
         return ""
@@ -396,15 +513,36 @@ def _rodar(argumentos: list[str], tempo_limite: int = 20) -> str:
 
 
 def _dedup_modos(modos: list[ModoVideo]) -> list[ModoVideo]:
-    """Remove duplicatas e mantem, por codec+resolucao, so a maior taxa."""
-    melhor: dict[tuple[str, int, int], ModoVideo] = {}
+    """Enxuga a lista sem esconder as taxas que alguem realmente escolheria.
+
+    Uma placa costuma anunciar cinco taxas por resolucao — 60, 30, 25, 20 e 10
+    no MS2109 daqui — e mostrar todas, para cada resolucao e cada codec, daria
+    uma lista de cinquenta itens que ninguem le.
+
+    Guardar so a maior, que era o que esta funcao fazia, enxuga demais: **apaga
+    o 30 fps**. E ele nao e um consolo para maquina fraca, e uma escolha
+    legitima e frequentemente melhor. Pedir 30 a placa e diferente de pedir 60
+    e receber 30: no primeiro caso nao vem quadro de enchimento
+    ([0008](../../docs/adr/0008-descartar-quadros-de-enchimento.md)), a banda
+    USB cai pela metade e sobra folga para o audio nao perder amostra.
+
+    O criterio: a maior taxa oferecida sempre entra — e o teto do aparelho —, e
+    junto com ela as taxas de `TAXAS_TELA`, que sao as que se escolhe de fato.
+    Aqui isso deixa 1920x1080 com 60 e 30, e descarta 25, 20 e 10.
+    """
+    por_resolucao: dict[tuple[str, int, int], list[ModoVideo]] = {}
     for m in modos:
-        chave = (m.codec, m.largura, m.altura)
-        atual = melhor.get(chave)
-        if atual is None or m.fps > atual.fps:
-            melhor[chave] = m
+        por_resolucao.setdefault((m.codec, m.largura, m.altura), []).append(m)
+
+    escolhidos: dict[tuple[str, int, int, float], ModoVideo] = {}
+    for chave, candidatos in por_resolucao.items():
+        teto = max(c.fps for c in candidatos)
+        for c in candidatos:
+            if c.fps == teto or c.fps in TAXAS_TELA:
+                escolhidos[(*chave, c.fps)] = c
+
     return sorted(
-        melhor.values(),
+        escolhidos.values(),
         key=lambda m: (m.comprimido, m.pixels, m.fps),
         reverse=True,
     )
@@ -452,7 +590,8 @@ def _listar_windows() -> Dispositivos:
         resultado = Dispositivos()
         for nome in nomes_video:
             resultado.video.append(DispositivoVideo(
-                nome=nome, caminho=f"video={nome}", modos=modos[nome].result()))
+                nome=nome, caminho=f"video={nome}", modos=modos[nome].result(),
+                identidade=nome))
         for nome in nomes_audio:
             taxas, canais = formatos[nome].result()
             resultado.audio.append(DispositivoAudio(
@@ -548,6 +687,9 @@ def _telas_windows() -> list[DispositivoVideo]:
             caminho="ddagrab" if usar_dda else "desktop",
             modos=_modos_tela(largura, altura),
             tipo=TIPO_TELA, indice=indice, origem=(x, y),
+            # A resolucao fica de fora da identidade: trocar o modo do monitor
+            # nao faz dele outro monitor.
+            identidade=f"saida{indice}",
         ))
 
     if len(achados) > 1:
@@ -562,6 +704,7 @@ def _telas_windows() -> list[DispositivoVideo]:
             nome=f"Todos os ecrãs — {largura}x{altura}",
             caminho="desktop", modos=_modos_tela(largura, altura),
             tipo=TIPO_TELA, origem=(esquerda, topo),
+            identidade="todos",
         ))
 
     return telas
@@ -571,10 +714,99 @@ _RE_XRANDR = re.compile(r"^\s*\d+:\s+\S*\s*(\d+)/\d+x(\d+)/\d+\+(\d+)\+(\d+)\s+(
                         re.MULTILINE)
 
 
+def sessao_wayland() -> bool:
+    """Se a sessao grafica e Wayland, com ou sem XWayland em pe.
+
+    Nao basta testar a ausencia de `DISPLAY`: o XWayland mantem essa variavel
+    definida, e essa e a configuracao padrao do GNOME no Ubuntu 24.04 e no
+    Zorin 18. Nessa sessao o x11grab abre sem erro, informa o tamanho correto e
+    entrega quadros inteiramente pretos — medido aqui, todo pixel em zero. O
+    compositor simplesmente nao expoe as janelas nativas ao servidor X.
+
+    `XDG_SESSION_TYPE` vem do logind e e o sinal confiavel; `WAYLAND_DISPLAY`
+    entra como reforco para quem roda fora de uma sessao do logind.
+    """
+    if os.environ.get("XDG_SESSION_TYPE", "").strip().lower() == "wayland":
+        return True
+    return bool(os.environ.get("WAYLAND_DISPLAY"))
+
+
+_AVISO_WAYLAND = (
+    "Esta é uma sessão Wayland, e sob Wayland a captura de tela por X11 grava "
+    "preto — o compositor não mostra as janelas ao servidor X.\n\n"
+    "Para gravar a tela, saia da sessão e escolha «Xorg» (ou «X11») na "
+    "engrenagem da tela de login antes de entrar de novo. A captura pela placa "
+    "HDMI→USB funciona normalmente nas duas sessões."
+)
+
+_AVISO_SEM_X = (
+    "Nenhum servidor gráfico X foi encontrado (a variável DISPLAY não está "
+    "definida), então não há tela para capturar por esta via."
+)
+
+_AVISO_SEM_FERRAMENTAS = (
+    "Faltam as ferramentas que enumeram as janelas abertas. Instale com:\n\n"
+    "    sudo apt install x11-utils\n\n"
+    "Depois clique em «Procurar dispositivos». (Em Fedora: sudo dnf install "
+    "xorg-x11-utils; em Arch: sudo pacman -S xorg-xprop xorg-xwininfo.)"
+)
+
+_AVISO_JANELA_WAYLAND = (
+    "Nenhuma janela capturável encontrada.\n\n"
+    "Esta é uma sessão Wayland, onde só dá para capturar aplicativos que rodam "
+    "sobre o XWayland — os que usam Wayland nativo, que hoje são a maioria, o "
+    "compositor não expõe, e por isso não aparecem na lista em vez de "
+    "aparecerem e gravarem preto.\n\n"
+    "Para capturar qualquer janela, entre numa sessão «Xorg» pela engrenagem da "
+    "tela de login. Capturar o ecrã inteiro também só funciona lá."
+)
+
+
+def motivo_sem_ecra() -> str:
+    """Por que nao da para capturar o ecra nesta maquina, ou "" se da.
+
+    A interface mostra este texto no lugar de uma lista vazia sem explicacao.
+    """
+    if WINDOWS:
+        return ""
+    if sessao_wayland():
+        return _AVISO_WAYLAND
+    if not os.environ.get("DISPLAY"):
+        return _AVISO_SEM_X
+    return ""
+
+
+def _impedimento_janela() -> str:
+    """O que impede de sequer tentar enumerar janelas, ou "" se nada impede.
+
+    Ao contrario do ecra, Wayland nao entra aqui: capturar uma janela pelo
+    `window_id` funciona para clientes XWayland mesmo numa sessao Wayland —
+    medido, com a cor exata da janela de teste. O que nao aparece sao os
+    aplicativos Wayland nativos, e esses nem chegam a ser enumerados.
+    """
+    if WINDOWS:
+        return ""
+    if not os.environ.get("DISPLAY"):
+        return _AVISO_SEM_X
+    if not _tem("xprop") or not _tem("xwininfo"):
+        return _AVISO_SEM_FERRAMENTAS
+    return ""
+
+
+def motivo_sem_janela() -> str:
+    """O que dizer quando a lista de janelas volta vazia."""
+    impedimento = _impedimento_janela()
+    if impedimento:
+        return impedimento
+    if sessao_wayland():
+        return _AVISO_JANELA_WAYLAND
+    return "Nenhuma janela encontrada."
+
+
 def _telas_linux() -> list[DispositivoVideo]:
-    if os.environ.get("WAYLAND_DISPLAY") and not os.environ.get("DISPLAY"):
-        # Sob Wayland puro o x11grab nao enxerga a tela; devolver uma opcao que
-        # so produz preto seria pior que nao oferecer nada.
+    if motivo_sem_ecra():
+        # Devolver uma opcao que so produz preto e pior que nao oferecer nada:
+        # o defeito so aparece depois de a gravacao terminar.
         return []
 
     telas: list[DispositivoVideo] = []
@@ -656,6 +888,7 @@ def _janelas_windows() -> list[DispositivoVideo]:
             caminho=titulo,  # o gdigrab localiza a janela pelo titulo
             modos=_modos_tela(largura, altura),
             tipo=TIPO_JANELA, origem=(r.left, r.top),
+            identidade=titulo,
         ))
         return True
 
@@ -663,32 +896,64 @@ def _janelas_windows() -> list[DispositivoVideo]:
     return achadas
 
 
-_RE_WMCTRL = re.compile(r"^(0x\w+)\s+\S+\s+\S+\s+(.+)$", re.MULTILINE)
+_RE_CLIENT_LIST = re.compile(r"0x[0-9a-fA-F]+")
+_RE_XWININFO_TITULO = re.compile(r'xwininfo:\s+Window id:\s+\S+\s+"(.*)"')
+_RE_XWININFO_X = re.compile(r"^\s*Absolute upper-left X:\s*(-?\d+)", re.MULTILINE)
+_RE_XWININFO_Y = re.compile(r"^\s*Absolute upper-left Y:\s*(-?\d+)", re.MULTILINE)
+_RE_XWININFO_LARGURA = re.compile(r"^\s*Width:\s*(\d+)", re.MULTILINE)
+_RE_XWININFO_ALTURA = re.compile(r"^\s*Height:\s*(\d+)", re.MULTILINE)
+_RE_XWININFO_MAPEADA = re.compile(r"^\s*Map State:\s*(\S+)", re.MULTILINE)
 
 
 def _janelas_linux() -> list[DispositivoVideo]:
-    if not _tem("wmctrl") or not _tem("xdotool"):
+    """Janelas gerenciadas pelo X, lidas do `_NET_CLIENT_LIST` da raiz.
+
+    `xprop` e `xwininfo` vem no mesmo pacote (`x11-utils`), que ja acompanha
+    qualquer instalacao grafica de Debian/Ubuntu/Zorin — diferente do `wmctrl`
+    e do `xdotool`, que esta funcao usava antes e que ninguem tem por padrao.
+    O efeito pratico era a lista voltar vazia numa maquina recem-instalada.
+
+    `_NET_CLIENT_LIST` e a propriedade que o gerenciador de janelas mantem com
+    as janelas que ele gerencia — a mesma que o `wmctrl` lia. Numa sessao
+    Wayland ela lista so os clientes XWayland, que sao exatamente os que o
+    x11grab consegue capturar; aplicativos Wayland nativos ficam de fora, e
+    ficar de fora e o comportamento certo: oferece-los so daria preto.
+    """
+    if _impedimento_janela():
         return []
 
     achadas: list[DispositivoVideo] = []
-    for achado in _RE_WMCTRL.finditer(_rodar(["wmctrl", "-l"])):
-        identificador, titulo = achado.group(1), achado.group(2).strip()
-        geometria = _rodar(["xdotool", "getwindowgeometry", "--shell", identificador])
-        valores = dict(
-            linha.split("=", 1) for linha in geometria.splitlines() if "=" in linha
-        )
+    identificadores = _RE_CLIENT_LIST.findall(
+        _rodar(["xprop", "-root", "_NET_CLIENT_LIST"], tempo_limite=5)
+    )
+    for identificador in identificadores:
+        info = _rodar(["xwininfo", "-id", identificador], tempo_limite=5)
+        mapeada = _RE_XWININFO_MAPEADA.search(info)
+        # Janela minimizada nao tem conteudo para o X entregar; capturar uma
+        # devolveria o que sobrou no buffer, ou nada.
+        if not mapeada or mapeada.group(1) != "IsViewable":
+            continue
         try:
-            x, y = int(valores["X"]), int(valores["Y"])
-            largura, altura = int(valores["WIDTH"]), int(valores["HEIGHT"])
-        except (KeyError, ValueError):
+            x = int(_RE_XWININFO_X.search(info).group(1))
+            y = int(_RE_XWININFO_Y.search(info).group(1))
+            largura = int(_RE_XWININFO_LARGURA.search(info).group(1))
+            altura = int(_RE_XWININFO_ALTURA.search(info).group(1))
+        except AttributeError:
             continue
         if largura < _MINIMO_JANELA[0] or altura < _MINIMO_JANELA[1]:
+            continue
+        titulo = _RE_XWININFO_TITULO.search(info)
+        titulo = titulo.group(1).strip() if titulo else identificador
+        if not titulo or titulo in _JANELAS_IGNORADAS:
             continue
         achadas.append(DispositivoVideo(
             nome=f"{titulo}  ({largura}x{altura})",
             caminho=identificador,
             modos=_modos_tela(largura, altura),
             tipo=TIPO_JANELA, origem=(x, y),
+            # O identificador da janela muda a cada execucao do aplicativo; o
+            # titulo e a unica coisa que sobrevive a fechar e reabrir.
+            identidade=titulo,
         ))
     return achadas
 
@@ -788,21 +1053,17 @@ def _card_alsa_do_video(caminho_video: str) -> int | None:
     return None
 
 
-_RE_PACTL_NOME = re.compile(r"^\s*Name:\s*(\S+)", re.MULTILINE)
-_RE_PACTL_CARD = re.compile(r'alsa\.card\s*=\s*"(\d+)"')
+def _fontes_pulse_por_card(fontes: list[FontePulse]) -> dict[int, str]:
+    """Mapeia indice de placa ALSA -> nome da fonte no PulseAudio.
 
-
-def _fontes_pulse_por_card() -> dict[int, str]:
-    """Mapeia indice de placa ALSA -> nome da fonte no PulseAudio."""
-    saida = _rodar(["pactl", "list", "sources"])
+    Monitores ficam de fora: eles carregam o `alsa.card` da saida, e parear a
+    placa de captura com o monitor dela seria gravar o que o PC esta tocando no
+    lugar do que a placa esta recebendo.
+    """
     mapa: dict[int, str] = {}
-    # Os blocos comecam em "Source #N"; separar por eles mantem cada nome junto
-    # das suas propriedades.
-    for bloco in re.split(r"\n(?=Source\s+#)", saida):
-        nome = _RE_PACTL_NOME.search(bloco)
-        card = _RE_PACTL_CARD.search(bloco)
-        if nome and card and not nome.group(1).endswith(".monitor"):
-            mapa.setdefault(int(card.group(1)), nome.group(1))
+    for fonte in fontes:
+        if fonte.card is not None and not fonte.monitor:
+            mapa.setdefault(fonte.card, fonte.nome)
     return mapa
 
 
@@ -810,14 +1071,18 @@ def _parear_linux(resultado: Dispositivos) -> None:
     if not resultado.video or not resultado.audio:
         return
 
-    usa_pulse = formato_entrada_audio() == "pulse"
-    por_card = _fontes_pulse_por_card() if usa_pulse else {}
+    via = via_audio_linux()
+    por_card = (_fontes_pulse_por_card(_fontes_pulse()) if via != VIA_ALSA else {})
 
     for dispositivo in resultado.video:
         card = _card_alsa_do_video(dispositivo.caminho)
         if card is None:
             continue
-        alvo = por_card.get(card) if usa_pulse else f"hw:{card},0"
+        if via == VIA_ALSA:
+            alvo = f"hw:{card},0"
+        else:
+            fonte = por_card.get(card)
+            alvo = _caminho_fonte_pulse(fonte, via) if fonte else None
         if not alvo:
             continue
         for audio in resultado.audio:
@@ -853,7 +1118,8 @@ def _listar_linux() -> Dispositivos:
         if not modos:
             continue
         resultado.video.append(
-            DispositivoVideo(nome=f"{nome} ({caminho})", caminho=caminho, modos=modos)
+            DispositivoVideo(nome=f"{nome} ({caminho})", caminho=caminho,
+                             modos=modos, identidade=nome)
         )
 
     if not _tem("v4l2-ctl") and resultado.video:
@@ -906,31 +1172,96 @@ def _modos_video_linux(caminho: str) -> list[ModoVideo]:
     return _dedup_modos(modos)
 
 
-_RE_PACTL = re.compile(r"^\d+\s+(\S+)\s")
+_RE_PACTL_NOME = re.compile(r"^\s*Name:\s*(\S+)", re.MULTILINE)
+_RE_PACTL_DESCRICAO = re.compile(r"^\s*Description:\s*(.+)$", re.MULTILINE)
+_RE_PACTL_MONITOR = re.compile(r"^\s*Monitor of Sink:\s*(.+)$", re.MULTILINE)
+_RE_PACTL_CARD = re.compile(r'alsa\.card\s*=\s*"(\d+)"')
+
+
+@dataclass(frozen=True)
+class FontePulse:
+    """Uma fonte de captura do PulseAudio/PipeWire, como o `pactl` a descreve."""
+
+    nome: str
+    descricao: str
+    card: int | None
+    monitor: bool
+    # So faz sentido em monitores: se este e o monitor da saida que esta
+    # tocando agora. Os outros monitores costumam entregar silencio digital.
+    padrao: bool = False
+
+
+def _sink_padrao() -> str:
+    """Nome da saida de audio em uso, ou vazio se nao der para saber."""
+    return _rodar(["pactl", "get-default-sink"], tempo_limite=5).strip()
+
+
+def _fontes_pulse() -> list[FontePulse]:
+    """Le `pactl list sources`. Lista vazia quando o servidor nao responde.
+
+    Usa a listagem longa, e nao a `short`, porque so ela traz a descricao legivel
+    ("Monitor of Built-in Audio") e o `alsa.card` de que o pareamento depende.
+    """
+    saida = _rodar(["pactl", "list", "sources"])
+    padrao = _sink_padrao()
+    fontes: list[FontePulse] = []
+    # Os blocos comecam em "Source #N"; separar por eles mantem cada nome junto
+    # das suas propriedades.
+    for bloco in re.split(r"\n(?=Source\s+#)", saida):
+        nome = _RE_PACTL_NOME.search(bloco)
+        if not nome:
+            continue
+        descricao = _RE_PACTL_DESCRICAO.search(bloco)
+        card = _RE_PACTL_CARD.search(bloco)
+        monitor = _RE_PACTL_MONITOR.search(bloco)
+        texto = descricao.group(1).strip() if descricao else nome.group(1)
+        # O servidor prefixa a descricao dos monitores com "Monitor of ", e a
+        # interface ja os apresenta como «Áudio do computador — ...». Manter os
+        # dois viraria "Áudio do computador — Monitor of Built-in Audio".
+        texto = texto.removeprefix("Monitor of ").strip() or nome.group(1)
+        saida_monitorada = monitor.group(1).strip() if monitor else "n/a"
+        fontes.append(FontePulse(
+            nome=nome.group(1),
+            descricao=texto,
+            card=int(card.group(1)) if card else None,
+            # "Monitor of Sink: n/a" nas fontes de verdade. O sufixo `.monitor`
+            # no nome diz o mesmo, mas e convencao de nomenclatura, nao campo.
+            monitor=saida_monitorada != "n/a",
+            padrao=bool(padrao) and saida_monitorada == padrao,
+        ))
+    return fontes
 
 
 def _audio_linux() -> list[DispositivoAudio]:
     padrao_taxas = [48000, 44100]
     dispositivos: list[DispositivoAudio] = []
 
-    # Os nomes precisam casar com o backend escolhido: fontes do PulseAudio nao
-    # sao aceitas pelo demuxer ALSA e vice-versa.
-    if formato_entrada_audio() == "pulse":
-        saida = _rodar(["pactl", "list", "short", "sources"])
-        for linha in saida.splitlines():
-            achado = _RE_PACTL.match(linha)
-            if not achado:
-                continue
-            fonte = achado.group(1)
+    # Os nomes precisam casar com o demuxer escolhido: fontes do PulseAudio nao
+    # sao aceitas cruas pelo demuxer ALSA, e por isso passam pelo prefixo.
+    via = via_audio_linux()
+    if via != VIA_ALSA:
+        entradas: list[DispositivoAudio] = []
+        monitores: list[DispositivoAudio] = []
+        for fonte in _fontes_pulse():
             # Monitor e a saida do proprio PC — exatamente o que se quer ao
             # gravar a tela, e exatamente o que causa eco se for reproduzido de
             # volta. Ele entra na lista marcado como loopback; quem impede o
             # eco e a interface, que desliga a monitoracao para essas fontes.
-            dispositivos.append(
-                DispositivoAudio(nome=fonte, caminho=fonte,
-                                 taxas=padrao_taxas, canais=[2, 1],
-                                 loopback=fonte.endswith(".monitor"))
-            )
+            destino = monitores if fonte.monitor else entradas
+            destino.append(DispositivoAudio(
+                nome=(f"{fonte.descricao} — saída padrão"
+                      if fonte.padrao else fonte.descricao),
+                caminho=_caminho_fonte_pulse(fonte.nome, via),
+                taxas=padrao_taxas, canais=[2, 1],
+                loopback=fonte.monitor,
+            ))
+        # O monitor da saida padrao na frente dos outros, pelo mesmo motivo que
+        # no WASAPI: e o que esta tocando quando o usuario pensa "o som do
+        # computador". Os demais existem — uma maquina com HDMI e caixas tem
+        # dois — e entregam silencio digital, que e justamente o defeito mais
+        # dificil de perceber antes de a gravacao acabar.
+        monitores.sort(key=lambda d: d.nome.endswith("— saída padrão"), reverse=True)
+        dispositivos = entradas + monitores
 
     if not dispositivos:
         # Sem PulseAudio: cai para ALSA lendo as placas registradas no kernel.
@@ -982,6 +1313,23 @@ def parear(resultado: Dispositivos) -> bool:
     except Exception:
         return False
     return any(d.audio_associado for d in resultado.video)
+
+
+def pasta_dados() -> Path:
+    """Onde o programa guarda o que aprendeu sobre esta maquina.
+
+    Nao e ao lado do executavel: em instalacao por usuario ele para em
+    `Program Files`, sem permissao de escrita
+    ([0018](../../docs/adr/0018-empacotar-com-pyinstaller-em-modo-pasta.md)).
+    Cada sistema tem o seu lugar para isto, e sao estes.
+    """
+    if WINDOWS:
+        base = os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local")
+    else:
+        base = os.environ.get("XDG_DATA_HOME") or (Path.home() / ".local" / "share")
+    pasta = Path(base) / "capturador"
+    pasta.mkdir(parents=True, exist_ok=True)
+    return pasta
 
 
 def pasta_videos_padrao() -> Path:

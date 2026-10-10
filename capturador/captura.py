@@ -62,6 +62,36 @@ _MAX_BLOCOS_AUDIO = 64
 _MIN_BYTES_JPEG = 256
 
 
+def opcoes_codificador(codificador: str, qualidade: int,
+                       ao_vivo: bool) -> dict[str, str]:
+    """Ajustes do codificador de video, por familia.
+
+    Cada uma chama o mesmo botao por um nome diferente: CRF no x264, CQ no
+    NVENC, global_quality no QuickSync e no AMF. Menor = melhor imagem.
+
+    `ao_vivo` separa os dois usos. Capturando, perder um quadro e pior que um
+    arquivo maior, entao o x264 vai de `veryfast`/`zerolatency`. Convertendo um
+    arquivo que ja existe nao ha quadro a perder — so tempo —, entao vale um
+    preset mais lento, que e o que de fato entrega arquivo menor com a mesma
+    qualidade.
+    """
+    if "nvenc" in codificador:
+        return {
+            "preset": "p5" if ao_vivo else "p6",
+            "tune": "hq", "rc": "vbr",
+            "cq": str(qualidade), "b:v": "0",
+        }
+    if "qsv" in codificador or "amf" in codificador:
+        return {"global_quality": str(qualidade)}
+    if ao_vivo:
+        return {
+            "crf": str(qualidade),
+            "preset": "veryfast",
+            "tune": "zerolatency",
+        }
+    return {"crf": str(qualidade), "preset": "medium"}
+
+
 def _com_extras(formato: str, opcoes: dict[str, str]) -> dict[str, str]:
     """Acrescenta opcoes que so existem em demuxers especificos.
 
@@ -476,19 +506,8 @@ class Gravador:
         fluxo.time_base = Fraction(1, 1000)
         fluxo.codec_context.time_base = Fraction(1, 1000)
 
-        if "nvenc" in config.codificador:
-            fluxo.options = {
-                "preset": "p5", "tune": "hq", "rc": "vbr",
-                "cq": str(config.qualidade), "b:v": "0",
-            }
-        elif "qsv" in config.codificador or "amf" in config.codificador:
-            fluxo.options = {"global_quality": str(config.qualidade)}
-        else:
-            fluxo.options = {
-                "crf": str(config.qualidade),
-                "preset": "veryfast",  # a captura e ao vivo: perder quadro e pior que arquivo maior
-                "tune": "zerolatency",
-            }
+        fluxo.options = opcoes_codificador(config.codificador, config.qualidade,
+                                           ao_vivo=True)
         self._codificados.append(fluxo)
         return fluxo
 
@@ -561,6 +580,18 @@ class Gravador:
             if self._fechado:
                 return
             self._fechado = True
+            # A FIFO retem o que sobrou do ultimo bloco inteiro — ate um quadro
+            # de codificador, ~21 ms a 48 kHz. Sem esta leitura parcial essas
+            # amostras morrem na memoria, e a trilha sai curta por um pedaco
+            # que cresce com o tamanho do quadro do codec.
+            if self._fifo_audio is not None and self._audio is not None:
+                try:
+                    resto = self._fifo_audio.read(partial=True)
+                    if resto is not None:
+                        for pacote in self._audio.encode(resto):
+                            self._saida.mux(pacote)
+                except (av.error.FFmpegError, ValueError):
+                    pass
             # Drena o que ficou dentro dos codificadores, senao os ultimos
             # quadros/amostras nao chegam ao arquivo. A lista, em vez de um
             # teste de perfil: o perfil Original tambem codifica audio quando

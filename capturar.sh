@@ -26,7 +26,7 @@ fi
 echo "Ambiente virtual não encontrado em: $VENV"
 echo
 echo "Crie-o uma vez com:"
-echo "  sudo apt install python3-venv v4l-utils"
+echo "  sudo apt install python3-venv v4l-utils libasound2-plugins"
 echo "  python3 -m venv \"$VENV\""
 echo "  \"$VENV/bin/pip\" install -r requisitos.txt"
 exit 1

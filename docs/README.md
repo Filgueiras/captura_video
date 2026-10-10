@@ -42,6 +42,8 @@ simplificar"*, e estiver enganado, essa linha merece um ADR.
 | [0008](adr/0008-descartar-quadros-de-enchimento.md) | Descartar os quadros de enchimento que a placa emite |
 | [0021](adr/0021-estado-do-audio-pelas-amostras.md) | Julgar o áudio pelas amostras, não pela chegada de blocos |
 | [0022](adr/0022-audio-do-computador-por-wasapi.md) | Gravar o áudio do computador por WASAPI, sem filtro de terceiros |
+| [0026](adr/0026-pos-producao-copia-ou-recompressao.md) | Pós-produção: uma operação só, com dois caminhos de saída |
+| [0023](adr/0023-pulseaudio-pelo-plugin-do-alsa.md) | Alcançar o PulseAudio pelo plugin do alsa-lib, que é o que existe no Linux |
 
 ### Descoberta de hardware
 
@@ -52,6 +54,7 @@ simplificar"*, e estiver enganado, essa linha merece um ADR.
 | [0011](adr/0011-parear-video-e-audio-pelo-aparelho.md) | Parear vídeo e áudio pelo aparelho físico |
 | [0012](adr/0012-ecra-por-ddagrab-janela-por-gdigrab.md) | Ecrã pelo `ddagrab`, janela pelo `gdigrab` |
 | [0013](adr/0013-so-codificadores-que-abrem.md) | Oferecer só os codificadores que abrem nesta máquina |
+| [0024](adr/0024-janela-por-window-id-e-wayland-pelo-tipo-de-sessao.md) | Janela pelo `window_id`, e Wayland detectado pelo tipo de sessão |
 
 ### Interface
 
@@ -61,6 +64,7 @@ simplificar"*, e estiver enganado, essa linha merece um ADR.
 | [0015](adr/0015-previa-por-polling.md) | Prévia por polling, com o quadro já reduzido na thread de captura |
 | [0016](adr/0016-aparencia-centralizada-e-paineis-por-lista.md) | Aparência centralizada em `tema.py`, painel montado por lista |
 | [0017](adr/0017-preferencias-em-qsettings.md) | Preferências do usuário em `QSettings` |
+| [0025](adr/0025-memoria-de-escolhas-por-dispositivo.md) | Memória de escolhas e medições por dispositivo, em SQLite |
 
 ### Entrega
 
